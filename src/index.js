@@ -33,15 +33,15 @@ const {
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 // On-chain fee program — collects dead fee + burn on every optimized bundle
-const PROGRAM_ID = 'ParA111111111111111111111111111111111111111'; // replace after deploy
+const PROGRAM_ID = 'GQBinKdihy1CB3GoD7HES5N4LQxZQWvwVrZA5VaAJKQL'; // replace after deploy
 
 // Fee split per optimized bundle
 const TREASURY = 'A1TRS3i2g62Zf6K4vybsW4JLx8wifqSoThyTQqXNaLDK';
 const BURN_ADDRESS = '1nc1nerator11111111111111111111111111111111';
 
 const FEES = {
-  TREASURY_SHARE: 0.70,   // 70% to x1scroll treasury (dead fee)
-  BURN_SHARE: 0.30,       // 30% burned 🔥
+  TREASURY_SHARE: 0.50,   // 50% to x1scroll treasury (dead fee)
+  BURN_SHARE: 0.50,       // 50% burned 🔥
   PER_BUNDLE: 500,        // 500 lamports per optimized bundle (~$0.0000002)
   PER_TX: 50,             // 50 lamports per transaction in bundle
 };
