@@ -1,0 +1,12 @@
+{
+  "name": "@x1scroll/parallel",
+  "version": "0.1.0",
+  "description": "Parallel execution optimizer for X1 — maximize X1's 16-thread banking stage",
+  "main": "src/index.js",
+  "keywords": ["x1", "parallel", "optimizer", "throughput", "x1scroll", "solana"],
+  "author": "x1scroll.io",
+  "license": "MIT",
+  "peerDependencies": {
+    "@solana/web3.js": "^1.x"
+  }
+}
