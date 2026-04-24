@@ -2,19 +2,25 @@
 **X1 Improvement Proposal**
 **Author:** Arnett Esters (@ArnettX1) — x1scroll.io
 **Date:** 2026-04-24
-**Status:** Draft
-**Category:** Client Upgrade (No Hard Fork Required)
+**Status:** Draft — Implementation In Progress
+**Category:** Tachyon Client Patch (No Hard Fork Required)
 **Requires:** Tachyon validator client update only
 
 ---
 
 ## Abstract
 
-This proposal describes a mempool-level spam filter for the X1 tachyon validator client that prevents low-cost transaction flooding from degrading network performance. The filter operates at the transaction acceptance layer — each validator independently decides whether to forward or drop transactions based on burst patterns and fee thresholds. No consensus change or hard fork is required.
+This proposal describes a mempool-level spam filter for the X1 tachyon validator client that prevents low-cost transaction flooding from degrading network performance. The filter operates at the `recv_transaction()` layer — each validator independently decides whether to forward or drop transactions based on burst patterns, fee floors, and account rate limits.
+
+**Current status:**
+- ✅ Application-layer proof of concept (JavaScript) — live on X1 mainnet, receipts available
+- ✅ Burst detection logic validated against live network data
+- ✅ Skip rate data from Ep 217-219 event
+- 🔧 Tachyon Rust implementation — **in progress** (see Section 6)
 
 ---
 
-## Motivation
+## 1. Motivation
 
 ### The Ep 217-219 Event
 
@@ -28,160 +34,223 @@ Between Epochs 217 and 219, X1 experienced a cascading network degradation trigg
 | 219   | ~26%+            | 465 fully failed  |
 | 220   | 2.35% (recovery) | 1,523 delegation removed |
 
-**Root cause:** X1 currently has zero priority fees. Any address can flood the network at minimal cost. Validators on resource-constrained hosting (Interserver) were overwhelmed processing the flood instead of casting votes.
+**Root cause:** X1 currently has near-zero transaction fees. Any address can flood the network at minimal cost. Validators on resource-constrained hosting were overwhelmed processing the flood instead of casting votes on time.
 
-**The fix does not require a hard fork.** The mempool acceptance layer is local to each validator. Changes there are opt-in client upgrades — validators adopt at their own pace, and spam resistance improves proportionally with adoption.
+### Why a Multiplier Alone Doesn't Work
+
+A naive fee multiplier (e.g., "50x during congestion") fails because 50 × near-zero = still near-zero. The fix requires an **absolute fee floor**, not just a relative multiplier:
+
+```
+// Wrong: multiplier on near-zero base
+required_fee = current_fee * 50  // 50 * 0.000005 XNT = 0.00025 XNT — spammer doesn't care
+
+// Right: absolute floor that scales with congestion
+required_fee = max(ABSOLUTE_FLOOR, current_fee * multiplier)
+// ABSOLUTE_FLOOR = 0.01 XNT during ALERT — makes 10,000 tx attack cost 100 XNT
+```
 
 ---
 
-## Specification
+## 2. Design Goals
 
-### Three-Signal Burst Detection
-
-The filter runs in tachyon's transaction ingestion path, before transactions enter the banking stage queue.
-
-**Signal 1 — Per-payer burst rate:**
-```
-if txs_from_fee_payer_in_last_slot >= BURST_THRESHOLD:
-    apply BURST_MULTIPLIER to required fee
-    OR drop if fee < BURST_MIN_FEE
-```
-
-**Signal 2 — Global queue depth:**
-```
-if pending_tx_queue > QUEUE_ALERT_THRESHOLD:
-    require fee >= BASE_FEE * CONGESTION_MULTIPLIER
-```
-
-**Signal 3 — Account contention:**
-```
-if pct_txs_with_shared_writable_accounts > CONTENTION_THRESHOLD:
-    prioritize low-contention txs
-    require higher fee for high-contention txs
-```
-
-### Recommended Default Parameters
-
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| `BURST_THRESHOLD` | 50 txs/slot per fee payer | 50+ txs in 400ms = clear spam pattern |
-| `BURST_MIN_FEE` | 250,000 lamports | 50x base fee — makes burst economically painful |
-| `QUEUE_ALERT_THRESHOLD` | 2,000 tx/slot | Based on Ep 217 queue depth at degradation onset |
-| `QUEUE_CRITICAL_THRESHOLD` | 5,000 tx/slot | Ep 218 collapse level |
-| `CONGESTION_MULTIPLIER_WARN` | 2x | Mild pressure |
-| `CONGESTION_MULTIPLIER_ALERT` | 5x | Ep 217 level |
-| `CONGESTION_MULTIPLIER_CRITICAL` | 20x | Ep 218 level |
-| `CONTENTION_THRESHOLD` | 0.40 | 40% of txs sharing writable accounts |
-
-All parameters should be tunable via validator config file — no recompile required.
-
-### Thread-Safe Implementation
-
-X1's 16-thread banking stage must not be serialized by fee sorting. The filter operates **before** thread assignment:
-
-```
-ingest_transaction(tx):
-    fee_payer = tx.message.accountKeys[0]
-    
-    // Check burst
-    if burst_tracker[fee_payer].count_last_slot() >= BURST_THRESHOLD:
-        if tx.fee < BURST_MIN_FEE:
-            drop(tx, reason="burst_below_min_fee")
-            return
-    
-    // Check queue depth
-    required_fee = BASE_FEE * current_congestion_multiplier()
-    if tx.fee < required_fee:
-        drop(tx, reason="fee_below_congestion_threshold")
-        return
-    
-    // Pass to thread scheduler (unchanged)
-    schedule_to_thread(tx)
-```
-
-Thread queues remain independent. Fee filtering happens at ingestion — the banking stage sees a pre-filtered queue and maintains full parallelism.
+1. **No hard fork** — mempool acceptance is a local validator decision
+2. **Account rotation resistance** — can't bypass by rotating fee payers every 49 txs
+3. **Absolute fee floors** — multipliers alone don't work; floors make spam expensive
+4. **Validator incentive alignment** — validators that filter earn *better* fees, not less
+5. **Griefing protection** — legitimate high-volume apps (DEXs, aggregators) must not be censored
 
 ---
 
-## Reference Implementation
+## 3. Specification
 
-A working JavaScript implementation demonstrating all three signals is available at:
+### 3.1 Three-Signal Detection
 
+**Signal 1 — Per-payer burst rate (with rotation resistance):**
+
+Simple per-payer tracking is bypassable by rotating accounts every 49 txs. The fix: track at multiple levels simultaneously.
+
+```rust
+struct BurstTracker {
+    per_payer: HashMap<Pubkey, SlotBucket>,      // per fee payer
+    per_ip: HashMap<IpAddr, SlotBucket>,          // per source IP (rotation-resistant)
+    per_program: HashMap<Pubkey, SlotBucket>,     // per program called
+}
+
+// Burst = ANY of these exceed threshold in one slot window
+fn is_burst(tracker: &BurstTracker, tx: &Transaction, source_ip: IpAddr) -> bool {
+    tracker.per_payer.get(&fee_payer(tx)).map_or(false, |b| b.count() >= BURST_PAYER_THRESHOLD)
+    || tracker.per_ip.get(&source_ip).map_or(false, |b| b.count() >= BURST_IP_THRESHOLD)
+}
+```
+
+**Signal 2 — Absolute fee floor (congestion-scaled):**
+
+```rust
+fn required_fee(congestion_level: CongestionLevel) -> u64 {
+    match congestion_level {
+        CongestionLevel::Nominal  => 5_000,          // 0.000005 XNT  (base)
+        CongestionLevel::Warn     => 50_000,         // 0.00005 XNT   (10x floor)
+        CongestionLevel::Alert    => 500_000,        // 0.0005 XNT    (100x floor)
+        CongestionLevel::Critical => 5_000_000,      // 0.005 XNT     (1000x floor)
+        CongestionLevel::Burst    => 50_000_000,     // 0.05 XNT      (10000x floor)
+    }
+}
+// At ALERT: flooding 10,000 txs costs 5 XNT — economically meaningful
+// At BURST: flooding 10,000 txs costs 500 XNT — attack becomes expensive
+```
+
+**Signal 3 — Griefing-safe high-volume whitelist:**
+
+Legitimate high-volume applications (DEX aggregators, arbitrage bots) must not be falsely flagged.
+
+```rust
+struct MempoolConfig {
+    // Validators can whitelist known high-volume legitimate programs
+    high_volume_whitelist: Vec<Pubkey>,  // e.g., xDEX program, lending liquidators
+    
+    // Burst threshold is higher for whitelisted programs
+    burst_threshold_normal: u32,   // 50 txs/slot
+    burst_threshold_whitelist: u32, // 500 txs/slot
+}
+```
+
+### 3.2 Validator Incentive Alignment
+
+Validators earn fees from transactions they include. Dropping low-fee txs reduces revenue if there's nothing else to include. The incentive aligns correctly because:
+
+1. **During spam attacks:** The mempool is full of near-zero fee spam. Filtering it allows higher-fee legitimate transactions to get through — validators earn *more* per slot.
+2. **During normal operation:** Fee floors are low (5,000 lamports) — no legitimate transactions are dropped.
+3. **Revenue argument:** A validator that accepts spam earns dust fees and misses votes (losing delegation). A validator that filters earns better fees and keeps delegation.
+
+### 3.3 Congestion Level Computation
+
+```rust
+fn compute_congestion_level(
+    pending_queue_depth: usize,
+    network_skip_rate_bps: u64,  // from getVoteAccounts
+) -> CongestionLevel {
+    // Ep 217-219 calibrated thresholds
+    match (pending_queue_depth, network_skip_rate_bps) {
+        (_, s) if s >= 2500 => CongestionLevel::Critical,  // 25%+ skip
+        (_, s) if s >= 1000 => CongestionLevel::Alert,     // 10%+ skip (Ep 217)
+        (q, _) if q >= 5000 => CongestionLevel::Alert,
+        (_, s) if s >= 500  => CongestionLevel::Warn,      // 5%+ skip
+        (q, _) if q >= 2000 => CongestionLevel::Warn,
+        _                   => CongestionLevel::Nominal,
+    }
+}
+```
+
+---
+
+## 4. What Exists Today vs. What Needs Building
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| Burst detection logic | ✅ Proven | adaptive-fee-gate.js |
+| Congestion level computation | ✅ Proven | adaptive-fee-gate.js |
+| Absolute fee floor design | ✅ Specified above | This XIP |
+| On-chain proof of fee tiers | ✅ 3/3 mainnet txs | See Section 5 |
+| Rust implementation in tachyon | 🔧 In progress | tachyon fork (see Section 6) |
+| IP-level burst tracking | 🔧 In progress | tachyon fork |
+| Griefing whitelist | 🔧 In progress | tachyon fork |
+| Local validator testing | 📋 Planned | After Rust implementation |
+
+---
+
+## 5. Proof of Concept
+
+### Application-Layer Reference Implementation
 **GitHub:** https://github.com/x1scroll-io/parallel/blob/main/src/adaptive-fee-gate.js
 
-### On-Chain Proof of Concept
+### On-Chain Receipts (X1 Mainnet)
 
-Three real transactions were submitted to X1 mainnet demonstrating fee tier enforcement:
+Three real transactions demonstrating fee tier enforcement, submitted 2026-04-24:
 
 | Test | Fee Paid | Multiplier | Status | Signature |
 |------|----------|------------|--------|-----------|
-| Baseline (WARN) | 10,000 lamports | 2x | ✅ Confirmed | `58bgAUGH...` |
-| Alert Level | 25,000 lamports | 5x | ✅ Confirmed | `43ngVenD...` |
-| Burst Level | 250,000 lamports | 50x | ✅ Confirmed | `5Wtryyxy...` |
+| Baseline (WARN) | 10,000 lamports | 2x | ✅ Confirmed | `58bgAUGHjbDg5hgqP3pTe9DLqiyPG92y28gNu2aePA7sfou2PUkW9CVKzk2P5Z1d5CzBCp3ema1w2Ahfy3WwpUDi` |
+| Alert Level | 25,000 lamports | 5x | ✅ Confirmed | `43ngVenDtcn7t7CRoJDPzJUysmLxmTEvSVbX4XUq42C3jTdKS4n2f5ogSjJf9JpHkiVPjPbKorGyzAjwxJTcxWUK` |
+| Burst Level | 250,000 lamports | 50x | ✅ Confirmed | `5WtryyxQ6nmtwZaG7coJwBiGNeL6ccs6bhcnGYyj2vVDvjTGSwZNCUbXbJDr7Y1aZUj2bqJZHUDa4NWxCGAKRZ8k` |
 
-**Explorer:** https://explorer.x1.xyz
-**Total cost of proof:** 0.000011 XNT
-
----
-
-## Expected Impact
-
-### If 30% of validators adopt:
-- Burst spammers filtered on 30% of the network
-- Meaningful degradation resistance even at partial adoption
-- Legitimate transactions unaffected (normal users don't send 50+ txs/slot)
-
-### If 70%+ of validators adopt:
-- Spam floods become economically irrational — attacker pays 50x per transaction
-- Ep 217-219 style cascade becomes extremely unlikely
-- Network skip rate during attack conditions stays near baseline
-
-### What this does NOT do:
-- Does not prevent a well-funded attacker willing to pay 50x fees
-- Does not address validator hardware/hosting resource limits
-- True prevention of unlimited-budget attacks requires protocol-level dynamic base fees (future hard fork)
+*Note: These demonstrate application-layer fee enforcement. The tachyon implementation enforces the same logic at the validator ingestion layer, making it mandatory for all transactions regardless of client.*
 
 ---
 
-## Backwards Compatibility
+## 6. Tachyon Implementation (In Progress)
 
-- No consensus changes
-- No changes to transaction format
-- Validators not running the upgrade are unaffected
-- Adopting validators become more spam-resistant immediately
-- No coordination required between validators
+The production implementation requires changes to the tachyon validator client in Rust.
+
+### Target File
+```
+tachyon/validator/src/banking_stage/
+├── transaction_scheduler.rs   // ADD: fee floor check before scheduling
+├── unprocessed_packet_batches.rs  // ADD: burst tracker state
+└── consume_worker.rs          // MODIFY: drop below-floor txs
+```
+
+### Key Changes Required
+```rust
+// In unprocessed_packet_batches.rs — add burst tracker
+pub struct UnprocessedTransactionStorage {
+    // existing fields...
+    burst_tracker: Arc<Mutex<BurstTracker>>,
+    mempool_config: MempoolConfig,
+}
+
+// In transaction_scheduler.rs — add fee floor check
+fn should_accept_transaction(
+    tx: &SanitizedTransaction,
+    burst_tracker: &BurstTracker,
+    congestion: CongestionLevel,
+    source_ip: IpAddr,
+) -> bool {
+    let fee = tx.message().fee_payer_effective_fee();
+    let floor = required_fee(congestion);
+    
+    if fee < floor { return false; }
+    if is_burst(burst_tracker, tx, source_ip) && fee < required_fee(CongestionLevel::Burst) {
+        return false;
+    }
+    true
+}
+```
+
+**Tachyon fork:** https://github.com/x1scroll-io/tachyon *(in progress)*
 
 ---
 
-## Upgrade Path
+## 7. Rollout Plan
 
-1. x1scroll.io ships reference implementation (done — see GitHub above)
-2. Jack's team reviews + integrates into tachyon client codebase
-3. Ship as opt-in config flag in next tachyon release: `--enable-mempool-spam-filter`
-4. Validators enable at next maintenance window
-5. Monitor skip rate improvement via skip-monitor: https://github.com/x1scroll-io/skip-monitor
-6. Make default-on once adoption > 50%
-
----
-
-## Related Work
-
-| Tool | Layer | Relationship |
-|------|-------|--------------|
-| Adaptive Fee Gate (this repo) | Application | Reference implementation for client-side fee logic |
-| Validator Shield | Node | Helps validators survive degradation — complementary |
-| Skip Monitor | Observability | Detects when spam filter should activate |
-| Shred Muncher | Cleanup | Post-event debris removal — complementary |
+1. ✅ Application-layer proof of concept (done)
+2. 🔧 Tachyon fork with Rust implementation (in progress)
+3. 📋 Local validator testing (single node)
+4. 📋 Testnet validation
+5. 📋 Submit PR to tachyon mainline for Jack's team review
+6. 📋 Ship as opt-in: `--enable-mempool-spam-filter` flag in tachyon config
+7. 📋 Monitor via skip-monitor: https://github.com/x1scroll-io/skip-monitor
+8. 📋 Make default-on once adoption > 50% of stake-weighted validators
 
 ---
 
-## Conclusion
+## 8. Open Questions for Jack's Team
 
-The Ep 217-219 event exposed a real vulnerability: X1 has no economic disincentive for spam. This proposal fixes that at the client level — no hard fork, no governance vote, immediate opt-in improvement.
+1. Does tachyon expose source IP in the gossip receive path, or is IP-level tracking infeasible?
+2. Is there an existing congestion signal in the banking stage we can hook into, or do we need to compute it independently?
+3. What's the preferred mechanism for the high-volume whitelist — config file, on-chain program, or governance parameter?
+4. Are there existing tests in tachyon's banking stage we should extend?
 
-The reference implementation is live, tested on mainnet, and ready for integration review.
+---
 
-**Ask:** Jack's team reviews the adaptive-fee-gate implementation and considers integrating burst detection + fee threshold enforcement into the tachyon mempool acceptance layer as a configurable opt-in feature.
+## 9. Related Work
+
+| Tool | Layer | Status |
+|------|-------|--------|
+| Adaptive Fee Gate | Application | ✅ Live |
+| Validator Shield | Node survival | ✅ Built |
+| Skip Monitor | Observability | ✅ Live |
+| Shred Muncher | Post-event cleanup | ✅ Built |
+| Tachyon mempool patch | Validator client | 🔧 In progress |
 
 ---
 
